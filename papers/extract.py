@@ -1,13 +1,14 @@
-import os, sys
-import json
+import os, json, re, sys
 import subprocess as sp
-import re
 import tempfile
+import traceback
 
-import requests
-from crossref.restful import Works, Etiquette
-from scholarly import scholarly
 import bibtexparser
+import fitz
+import requests
+from rapidfuzz.fuzz import token_set_ratio
+from crossref.restful import Works, Etiquette
+from scholarly import scholarly, ProxyGenerator
 
 import papers
 from papers.config import cached
@@ -23,6 +24,13 @@ my_etiquette = Etiquette('papers', 1.0, 'https://github.com/perrette/papers',
                          'mahe.perrette@gmail.com')
 work = Works(etiquette=my_etiquette)
 
+pg = ProxyGenerator()
+success = pg.FreeProxies()
+#print(success)
+scholarly.use_proxy(pg)
+
+# # # # # # # # # #
+
 
 class DOIParsingError(ValueError):
     pass
@@ -35,8 +43,6 @@ class DOIRequestError(ValueError):
 # PDF parsing / crossref requests
 # ===============================
 def readpdf_fitz(pdf_path, pages=None, first=None, last=None):
-    import fitz
-
     # Open the PDF file
     document = fitz.open(pdf_path)
     text = ""
@@ -248,8 +254,6 @@ def extract_txt_metadata(txt,
         except:
             logger.debug('proquest query unsuccessful')
 
-    sys.exit(0)
-
     if search_doi and not bibtex:
         try:
             logger.debug('parse doi')
@@ -322,17 +326,6 @@ def fetch_bibtex_by_arxiv(arxiv_id):
         return f"Error: Unable to fetch BibTeX (HTTP {response.status_code})"
 
 
-def fetch_bibtex_by_proquest(proquest_id):
-    """ Get bibtex entry by proquest id. """
-    search_query = scholarly.search_pubs( \
-        f'proquest {proquest_id}')
-    # get the most likely match of the first results
-    results = list(search_query)
-    result = results[0]
-    print(result)
-    return scholarly.bibtex(result)
-
-
 def fetch_bibtex_by_doi(doi):
     if "arxiv" in doi.lower():
         return fetch_bibtex_by_arxiv(doi.split("arXiv.")[1])
@@ -374,10 +367,25 @@ def _get_page_fast(pagerequest):
 
 def _scholar_score(txt, bib):
     # high score means high similarity
-    from rapidfuzz.fuzz import token_set_ratio
     return sum(
         token_set_ratio(bib[k], txt) for k in ['title', 'author', 'abstract']
         if k in bib)
+
+
+def fetch_bibtex_by_proquest(proquest_id):
+    """ Get bibtex entry from Google Scholar by proquest id. """
+    try:
+        print(f'proquest id {proquest_id}')
+        results = scholarly.search_pubs(f'proquest {proquest_id}')
+        results = list(results)
+        result = results[0]
+        print(result)
+        bibtex = scholarly.bibtex(result)
+        return bibtex
+    except Exception as e:
+        print(e)
+        traceback.print_exc()
+    return None
 
 
 @cached('scholar-bibtex.json', hashed_key=True)
@@ -404,7 +412,6 @@ def fetch_bibtex_by_fulltext_scholar(txt, assess_results=True):
 
 def _crossref_score(txt, r):
     # high score means high similarity
-    from rapidfuzz.fuzz import token_set_ratio
     score = 0
     if 'author' in r:
         author = ' '.join(
