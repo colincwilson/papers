@@ -1,4 +1,4 @@
-import os
+import os, sys
 import json
 import subprocess as sp
 import re
@@ -6,6 +6,7 @@ import tempfile
 
 import requests
 from crossref.restful import Works, Etiquette
+from scholarly import scholarly
 import bibtexparser
 
 import papers
@@ -17,12 +18,15 @@ from bibtexparser.customization import convert_to_unicode
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
-
-my_etiquette = Etiquette('papers', papers.__version__, 'https://github.com/perrette/papers', 'mahe.perrette@gmail.com')
+# papers.__version__
+my_etiquette = Etiquette('papers', 1.0, 'https://github.com/perrette/papers',
+                         'mahe.perrette@gmail.com')
 work = Works(etiquette=my_etiquette)
+
 
 class DOIParsingError(ValueError):
     pass
+
 
 class DOIRequestError(ValueError):
     pass
@@ -39,16 +43,17 @@ def readpdf_fitz(pdf_path, pages=None, first=None, last=None):
 
     # Iterate through the pages
     for page_num in range(len(document)):
-        if pages is not None and page_num+1 not in pages:
+        if pages is not None and page_num + 1 not in pages:
             continue
-        elif first is not None and page_num+1 < first:
+        elif first is not None and page_num + 1 < first:
             continue
-        elif last is not None and page_num+1 > last:
+        elif last is not None and page_num + 1 > last:
             continue
         page = document.load_page(page_num)
         text += page.get_text()
 
     return text
+
 
 def readpdf_poputils(pdf, first=None, last=None, pages=None):
     # DEPRECATED
@@ -65,6 +70,7 @@ def readpdf_poputils(pdf, first=None, last=None, pages=None):
     os.remove(tmptxt)
 
     return txt
+
 
 def readpdf(pdf, first=None, last=None):
     # TODO the python package pdftotext can do this directly, with no temp file and no I/O.
@@ -110,8 +116,24 @@ def readpdf_image(pdf, first=None, last=None):
 
     return txt
 
-REGEXP = re.compile(r'[doi,doi.org/][\s\.\:]{0,2}(10\.\d{4}[\d\:\.\-\/a-z]+)[A-Z\s,\n]')
-ARXIV = re.compile(r'arxiv:\s*(\d{4}\.\d{4,5})')
+
+PROQUEST_REGEXP = re.compile( \
+    r'ProQuest.*?(\d{7,})', re.IGNORECASE)
+DOI_REGEXP = re.compile( \
+    r'[doi,doi.org/][\s\.\:]{0,2}(10\.\d{4}[\d\:\.\-\/a-z]+)[A-Z\s,\n]')
+ARXIV_REGEXP = re.compile(r'arxiv:\s*(\d{4}\.\d{4,5})')
+
+
+def parse_proquest(txt):
+    txt = txt.replace('\n', ' ')  # Allow multiline matching.
+    matches = PROQUEST_REGEXP.findall(' ' + txt.lower() + ' ')
+    if matches:
+        match = matches[0]
+        match = match.replace('\n', '').strip('.')
+        proquest_id = match.replace('[^0-9]*', '')
+        return proquest_id
+    return None
+
 
 def parse_doi(txt):
     # based on: https://doeidoei.wordpress.com/2009/10/22/regular-expression-to-match-a-doi-digital-object-identifier/
@@ -125,15 +147,15 @@ def parse_doi(txt):
     # d. /^10.1021/\w\w\d++$/i
     # e. /^10.1207/[\w\d]+\&\d+_\d+$/i
 
-    matches = REGEXP.findall(' '+txt.lower()+' ')
+    matches = DOI_REGEXP.findall(' ' + txt.lower() + ' ')
 
     if not matches:
 
         # try arxiv pattern
-        match = ARXIV.search(txt.lower())
+        match = ARXIV_REGEXP.search(txt.lower())
         if match:
             arxiv_id = match.group(1)
-            matches = [ f"10.48550/arXiv.{arxiv_id}" ]
+            matches = [f"10.48550/arXiv.{arxiv_id}"]
 
         else:
             raise DOIParsingError('parse_doi::no matches')
@@ -141,21 +163,21 @@ def parse_doi(txt):
     match = matches[0]
 
     # clean expression
-    doi = match.replace('\n','').strip('.')
+    doi = match.replace('\n', '').strip('.')
 
     if doi.lower().endswith('.received'):
         doi = doi[:-len('.received')]
 
     # quality check
     if len(doi) <= 8:
-        raise DOIParsingError('failed to extract doi: '+doi)
+        raise DOIParsingError('failed to extract doi: ' + doi)
 
     return doi
 
 
 def isvaliddoi(doi):
     try:
-        doi2 = parse_doi('doi:'+doi)
+        doi2 = parse_doi('doi:' + doi)
     except:
         return False
     return doi.lower() == doi2.lower()
@@ -169,7 +191,7 @@ def pdfhead(pdf, maxpages=10, minwords=200, image=False):
     txt = ''
     while len(txt.strip().split()) < minwords and i < maxpages:
         i += 1
-        logger.debug('read pdf page: '+str(i))
+        logger.debug('read pdf page: ' + str(i))
         if image:
             txt += readpdf_image(pdf, first=i, last=i)
         else:
@@ -197,29 +219,48 @@ def query_text(txt, max_query_words=200):
     # limit overall length
     query_txt = ' '.join(query_txt.strip().split()[:max_query_words])
 
-    assert len(query_txt.split()) >= 3, 'needs at least 3 query words, got: '+repr(query_txt)
+    assert len(query_txt.split()
+               ) >= 3, 'needs at least 3 query words, got: ' + repr(query_txt)
     return query_txt
 
 
-def extract_txt_metadata(txt, search_doi=True, search_fulltext=False, max_query_words=200, scholar=False):
+def extract_txt_metadata(txt,
+                         search_proquest=True,
+                         search_doi=True,
+                         search_fulltext=False,
+                         max_query_words=200,
+                         scholar=False):
     """
     extract metadata from text, by parsing and doi-query, or by fulltext query in google scholar
     """
-    assert search_doi or search_fulltext, 'no search criteria specified for metadata'
+    assert search_proquest or search_doi or search_fulltext, 'no search criteria specified for metadata'
 
     bibtex = None
 
-    if search_doi:
+    if search_proquest and not bibtex:
+        try:
+            logger.debug('parse proquest id')
+            proquest_id = parse_proquest(txt)
+            logger.info('found proquest id:' + proquest_id)
+            logger.debug('query bibtext by proquest id')
+            bibtex = fetch_bibtex_by_proquest(proquest_id)
+            logger.debug('proquest query successful')
+        except:
+            logger.debug('proquest query unsuccessful')
+
+    sys.exit(0)
+
+    if search_doi and not bibtex:
         try:
             logger.debug('parse doi')
             doi = parse_doi(txt)
-            logger.info('found doi:'+doi)
+            logger.info('found doi:' + doi)
             logger.debug('query bibtex by doi')
             bibtex = fetch_bibtex_by_doi(doi)
             logger.debug('doi query successful')
 
         except DOIParsingError as error:
-            logger.debug('doi parsing error: '+str(error))
+            logger.debug('doi parsing error: ' + str(error))
 
         except DOIRequestError as error:
             return '''@misc{{{doi},
@@ -246,19 +287,30 @@ def extract_txt_metadata(txt, search_doi=True, search_fulltext=False, max_query_
     return bibtex
 
 
-def extract_pdf_metadata(pdf, search_doi=True, search_fulltext=True, maxpages=10, minwords=200, image=False, **kw):
+def extract_pdf_metadata(pdf,
+                         search_proquest=True,
+                         search_doi=True,
+                         search_fulltext=True,
+                         maxpages=10,
+                         minwords=200,
+                         image=False,
+                         **kw):
     txt = pdfhead(pdf, maxpages, minwords, image=image)
-    return extract_txt_metadata(txt, search_doi, search_fulltext, **kw)
+    return extract_txt_metadata(txt, search_proquest, search_doi,
+                                search_fulltext, **kw)
+
 
 @cached('crossref.json')
 def fetch_crossref_by_doi(doi):
-    url = "http://api.crossref.org/works/"+doi
-    response = work.do_http_request('get', url, custom_header={'user-agent': str(work.etiquette)})
+    url = "http://api.crossref.org/works/" + doi
+    response = work.do_http_request(
+        'get', url, custom_header={'user-agent': str(work.etiquette)})
     try:
         response.raise_for_status()
     except Exception as error:
-        raise DOIRequestError(repr(doi)+': '+repr(error))
+        raise DOIRequestError(repr(doi) + ': ' + repr(error))
     return response.json()
+
 
 @cached('arxiv.json')
 def fetch_bibtex_by_arxiv(arxiv_id):
@@ -268,6 +320,18 @@ def fetch_bibtex_by_arxiv(arxiv_id):
         return response.text
     else:
         return f"Error: Unable to fetch BibTeX (HTTP {response.status_code})"
+
+
+def fetch_bibtex_by_proquest(proquest_id):
+    """ Get bibtex entry by proquest id. """
+    search_query = scholarly.search_pubs( \
+        f'proquest {proquest_id}')
+    # get the most likely match of the first results
+    results = list(search_query)
+    result = results[0]
+    print(result)
+    return scholarly.bibtex(result)
+
 
 def fetch_bibtex_by_doi(doi):
     if "arxiv" in doi.lower():
@@ -288,16 +352,20 @@ def fetch_bibtex_by_doi(doi):
 
 @cached('crossref-json.json')
 def fetch_json_by_doi(doi):
-    url = "http://api.crossref.org/works/"+doi+"/transform/application/json"
-    jsontxt = work.do_http_request('get', url, custom_header={'user-agent': str(work.etiquette)}).text
+    url = "http://api.crossref.org/works/" + doi + "/transform/application/json"
+    jsontxt = work.do_http_request('get',
+                                   url,
+                                   custom_header={
+                                       'user-agent': str(work.etiquette)
+                                   }).text
     return jsontxt.dumps(json)
-
 
 
 def _get_page_fast(pagerequest):
     """Return the data for a page on scholar.google.com"""
-    from scholarly import scholarly
-    resp = scholarly._SESSION.get(pagerequest, headers=scholarly._HEADERS, cookies=scholarly._COOKIES)
+    resp = scholarly._SESSION.get(pagerequest,
+                                  headers=scholarly._HEADERS,
+                                  cookies=scholarly._COOKIES)
     if resp.status_code == 200:
         return resp.text
     else:
@@ -307,12 +375,13 @@ def _get_page_fast(pagerequest):
 def _scholar_score(txt, bib):
     # high score means high similarity
     from rapidfuzz.fuzz import token_set_ratio
-    return sum(token_set_ratio(bib[k], txt) for k in ['title', 'author', 'abstract'] if k in bib)
+    return sum(
+        token_set_ratio(bib[k], txt) for k in ['title', 'author', 'abstract']
+        if k in bib)
 
 
 @cached('scholar-bibtex.json', hashed_key=True)
 def fetch_bibtex_by_fulltext_scholar(txt, assess_results=True):
-    from scholarly import scholarly
     # scholarly._get_page = _get_page_fast  # remove waiting time
     logger.debug(txt)
     search_query = scholarly.search_pubs(txt)
@@ -332,18 +401,21 @@ def fetch_bibtex_by_fulltext_scholar(txt, assess_results=True):
 
     return scholarly.bibtex(result)
 
+
 def _crossref_score(txt, r):
     # high score means high similarity
     from rapidfuzz.fuzz import token_set_ratio
     score = 0
     if 'author' in r:
-        author = ' '.join([p['family'] for p in r.get('author',[]) if 'family' in p])
+        author = ' '.join(
+            [p['family'] for p in r.get('author', []) if 'family' in p])
         score += token_set_ratio(author, txt)
     if 'title' in r:
         score += token_set_ratio(r['title'][0], txt)
     if 'abstract' in r:
         score += token_set_ratio(r['abstract'], txt)
     return score
+
 
 def map_crossref_to_bibtex_type(crossref_type):
     mapping = {
@@ -372,7 +444,8 @@ def format_authors(authors):
 
 
 def crossref_to_bibtex(message):
-    entry_type = message.get('type', 'misc')  # Default to 'misc' if type is not specified
+    entry_type = message.get(
+        'type', 'misc')  # Default to 'misc' if type is not specified
 
     # Common fields
     bib_entry = {
@@ -411,7 +484,6 @@ def crossref_to_bibtex(message):
             'isbn': message.get('ISBN', [''])[0],
         })
 
-
     elif entry_type == 'proceedings-article':
         bib_entry.update({
             'booktitle': message.get('container-title', [''])[0],
@@ -420,15 +492,21 @@ def crossref_to_bibtex(message):
         })
     elif entry_type == 'report':
         bib_entry.update({
-            'institution': message.get('institution', {}).get('name', ''),
+            'institution':
+            message.get('institution', {}).get('name', ''),
         })
     elif entry_type == 'thesis':
         bib_entry.update({
-            'school': message.get('institution', {}).get('name', ''),
-            'type': message.get('type', ''),
+            'school':
+            message.get('institution', {}).get('name', ''),
+            'type':
+            message.get('type', ''),
         })
 
-    bib_entry = {k: v for k, v in bib_entry.items() if v}  # Remove empty fields
+    bib_entry = {
+        k: v
+        for k, v in bib_entry.items() if v
+    }  # Remove empty fields
 
     # Create a BibDatabase object
     db = bibtexparser.bibdatabase.BibDatabase()
@@ -443,7 +521,7 @@ def crossref_to_bibtex(message):
 
 # @cached('crossref-bibtex-fulltext.json', hashed_key=True)
 def fetch_bibtex_by_fulltext_crossref(txt, **kw):
-    logger.debug('crossref fulltext seach:\n'+txt)
+    logger.debug('crossref fulltext seach:\n' + txt)
 
     # get the most likely match of the first results
     # results = []
@@ -452,7 +530,11 @@ def fetch_bibtex_by_fulltext_crossref(txt, **kw):
     #     if i > 50:
     #         break
     query = work.query(txt, **kw).sort('score')
-    query_result = query.do_http_request('get', query.url, custom_header={'user-agent':str(query.etiquette)}).text
+    query_result = query.do_http_request('get',
+                                         query.url,
+                                         custom_header={
+                                             'user-agent': str(query.etiquette)
+                                         }).text
     results = json.loads(query_result)['message']['items']
 
     if len(results) > 1:
@@ -463,7 +545,7 @@ def fetch_bibtex_by_fulltext_crossref(txt, **kw):
             if score > maxscore:
                 maxscore = score
                 result = res
-        logger.info('score: '+str(maxscore))
+        logger.info('score: ' + str(maxscore))
 
     elif len(results) == 0:
         raise ValueError('crossref fulltext: no results')
@@ -481,9 +563,9 @@ def fetch_entry(e):
     else:
         e = convert_to_unicode(e)
         kw = {}
-        if e.get('author',''):
+        if e.get('author', ''):
             kw['author'] = family_names(e['author'])
-        if e.get('title',''):
+        if e.get('title', ''):
             kw['title'] = e['title']
         if kw:
             bibtex = fetch_bibtex_by_fulltext_crossref('', **kw)
@@ -493,16 +575,17 @@ def fetch_entry(e):
     return db.entries[0]
 
 
-
 ############### HERE A HACK DESIGNED FOR THE ESD JOURNAL ################
 # That journal often provides DOI that are not yet registered in crossref
 # so we need to fetch the bibtex from the journal website
 # Thanks Le Chat for near-instantaneous and elegantly designed code
 
+
 def fetch_html(url):
     response = requests.get(url)
     response.raise_for_status()  # Raise an error for bad status codes
     return response.text
+
 
 def find_bibtex_links(html_content, base_url):
     soup = BeautifulSoup(html_content, 'html.parser')
@@ -513,17 +596,21 @@ def find_bibtex_links(html_content, base_url):
             full_url = urljoin(base_url, href)
             yield full_url
 
+
 def download_bibtex(url):
     response = requests.get(url)
     response.raise_for_status()
     return response.text
 
+
 def parse_bibtex(bibtex_content, target_doi):
     bib_database = bibtexparser.loads(bibtex_content)
     for entry in bib_database.entries:
-        if (entry.get('doi', '') or entry.get('DOI', '')).lower() == target_doi.lower():
+        if (entry.get('doi', '')
+                or entry.get('DOI', '')).lower() == target_doi.lower():
             return entry
     return None
+
 
 def fetch_bibtex_on_journal_website(doi):
     base_url = f"https://doi.org/{doi}"
@@ -535,3 +622,9 @@ def fetch_bibtex_on_journal_website(doi):
             return bibtex_entry
 
     raise DOIRequestError("No matching BibTeX entry found for the given DOI.")
+
+
+if __name__ == "__main__":
+    pdf_file = sys.argv[1]
+    ret = extract_pdf_metadata(pdf_file)
+    print(ret)
